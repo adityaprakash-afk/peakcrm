@@ -1511,9 +1511,7 @@ class TestGuestFileAndAttachments(IntegrationTestCase):
 		self.assertTrue(doc_a.file_url.startswith("/files/"))
 
 		# B's row: unchanged (the actual regression this test guards)
-		self.assertEqual(
-			doc_b.is_private, 1, "B's is_private silently changed to public — data leak"
-		)
+		self.assertEqual(doc_b.is_private, 1, "B's is_private silently changed to public — data leak")
 		self.assertTrue(
 			doc_b.file_url.startswith("/private/files/"),
 			"B's file_url was rewritten to the public path — data leak",
