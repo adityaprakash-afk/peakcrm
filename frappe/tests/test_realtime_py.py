@@ -14,8 +14,10 @@ in an integration run.
 """
 
 import asyncio
+import json
 import sys
 import threading
+import time
 import types
 import unittest
 from collections.abc import Awaitable, Callable, Iterator
@@ -50,7 +52,7 @@ from frappe.realtime import bridge as bridge_mod
 from frappe.realtime import dispatch as dispatch_mod
 from frappe.realtime import handlers as handlers_mod
 from frappe.realtime.auth import Session
-from frappe.realtime.config import RealtimeConfig, get_config
+from frappe.realtime.config import DEFAULT_WORKER_THREADS, RealtimeConfig, get_config
 from frappe.realtime.context import frappe_context
 from frappe.realtime.registry import Registry
 from frappe.realtime.socket import Socket, SyncSocket
@@ -206,6 +208,7 @@ class TestAuthHelpers(unittest.TestCase):
 
 class TestAuthenticate(unittest.IsolatedAsyncioTestCase):
 	def setUp(self):
+		auth_mod._permission_cache.clear()
 		patcher = patch.object(auth_mod, "get_socketio_secret", new=AsyncMock(return_value="secret"))
 		patcher.start()
 		self.addCleanup(patcher.stop)
@@ -277,6 +280,42 @@ class TestAuthenticate(unittest.IsolatedAsyncioTestCase):
 				"/api/method/frappe.realtime.has_permission",
 			],
 		)
+
+
+class FakeRedis:
+	"""The two commands that get_socketio_secret() uses."""
+
+	def __init__(self, value: bytes | None):
+		self.value = value
+		self.writes = []
+
+	async def get(self, key: str) -> bytes | None:
+		return self.value
+
+	async def set(self, key: str, value: str, nx: bool = False) -> None:
+		self.writes.append((value, nx))
+		self.value = value.encode()
+
+
+class TestSocketioSecret(unittest.IsolatedAsyncioTestCase):
+	def _redis(self, value: bytes | None) -> FakeRedis:
+		client = FakeRedis(value)
+		patcher = patch.object(auth_mod, "_secret_client", client)
+		patcher.start()
+		self.addCleanup(patcher.stop)
+		return client
+
+	async def test_an_existing_secret_is_read(self):
+		client = self._redis(b"from-the-web")
+		self.assertEqual(await auth_mod.get_socketio_secret("redis://x"), "from-the-web")
+		self.assertEqual(client.writes, [])
+
+	async def test_a_missing_secret_is_made(self):
+		# A boot with an empty redis: a side that could only read would send no secret.
+		# nx keeps one value if the web writes its own at the same moment.
+		client = self._redis(None)
+		secret = await auth_mod.get_socketio_secret("redis://x")
+		self.assertEqual(client.writes, [(secret, True)])
 
 
 class TestSharedHttpClient(unittest.IsolatedAsyncioTestCase):
@@ -362,6 +401,85 @@ class TestSharedHttpClient(unittest.IsolatedAsyncioTestCase):
 		secret_client.aclose.assert_awaited_once()
 
 
+class TestLocalRequest(unittest.IsolatedAsyncioTestCase):
+	"""Embedded, the web callback runs in-process instead of over loopback HTTP."""
+
+	def setUp(self):
+		patcher = patch.object(auth_mod, "get_socketio_secret", new=AsyncMock(return_value="secret"))
+		patcher.start()
+		self.addCleanup(patcher.stop)
+
+	@contextmanager
+	def _wsgi(self, status: str = "200 OK", payload: object = None) -> Iterator[dict]:
+		"""Stand in for frappe.app.application; importing the real one is expensive."""
+		seen: dict = {}
+
+		def application(environ, start_response):
+			seen.update(environ, _thread=threading.get_ident())
+			body = json.dumps({"message": payload} if payload is not None else {}).encode()
+			start_response(status, [("Content-Type", "application/json")])
+			return [body]
+
+		stub = types.ModuleType("frappe.app")
+		stub.application = application
+		with patch.dict(sys.modules, {"frappe.app": stub}), patch.object(auth_mod, "_local_client", None):
+			yield seen
+
+	def _request(self):
+		return auth_mod._make_request(
+			make_environ(site_header="s1"),
+			auth_mod.Credentials(sid="abc"),
+			make_config(embedded=True),
+			"s1",
+			"shared-secret",
+		)
+
+	async def test_request_carries_credential_site_secret_and_origin(self):
+		with self._wsgi(payload=1) as seen:
+			body = await self._request()("/api/method/x", "POST", params={"doctype": "ToDo"})
+
+		self.assertEqual(body["message"], 1)
+		self.assertEqual(seen["REQUEST_METHOD"], "POST")
+		self.assertEqual(seen["PATH_INFO"], "/api/method/x")
+		self.assertEqual(seen["QUERY_STRING"], "doctype=ToDo")
+		self.assertEqual(seen["HTTP_COOKIE"], "sid=abc")
+		self.assertEqual(seen["HTTP_X_FRAPPE_SITE_NAME"], "s1")
+		self.assertEqual(seen["HTTP_X_FRAPPE_SOCKET_SECRET"], "shared-secret")
+		# The web app reads Origin for site resolution, so a local call must carry it.
+		self.assertEqual(seen["HTTP_ORIGIN"], "http://s1")
+
+	async def test_error_status_raises_like_raise_for_status(self):
+		with self._wsgi(status="403 FORBIDDEN"):
+			with self.assertRaises(ValueError):
+				await self._request()("/api/method/x")
+
+	async def test_empty_body_is_omitted_not_sent_as_null(self):
+		with self._wsgi() as seen:
+			await self._request()("/api/method/x")
+
+		self.assertEqual(seen.get("CONTENT_LENGTH") or "0", "0")
+
+	async def test_authenticate_uses_it_end_to_end(self):
+		with self._wsgi(
+			payload={"user": "a@b.com", "user_type": "System User", "installed_apps": ["frappe"]}
+		):
+			session = await auth_mod.authenticate(
+				make_environ(host="s1", origin="http://s1"), "/s1", make_config(embedded=True)
+			)
+
+		self.assertEqual(session.user, "a@b.com")
+		self.assertEqual(session.site, "s1")
+
+	async def test_it_does_not_block_the_loop(self):
+		# The WSGI call is blocking; it must go to a thread or a slow request would
+		# stall every other socket on the loop.
+		caller = threading.get_ident()
+		with self._wsgi() as seen:
+			await self._request()("/api/method/x")
+
+		self.assertNotEqual(seen["_thread"], caller)
+
+
 class TestRegistry(unittest.TestCase):
 	def test_on_registers_with_flags(self):
 		reg = Registry()
@@ -414,6 +532,10 @@ class TestRegistry(unittest.TestCase):
 
 
 class TestSocket(unittest.IsolatedAsyncioTestCase):
+	def setUp(self):
+		# The permission cache belongs to the process, not to a socket.
+		auth_mod._permission_cache.clear()
+
 	def _socket(
 		self,
 		sio: FakeSio | None = None,
@@ -452,7 +574,70 @@ class TestSocket(unittest.IsolatedAsyncioTestCase):
 
 	async def test_has_permission_http(self):
 		self.assertTrue(await self._socket(request=make_request(1)).has_permission("DT", "n1"))
-		self.assertFalse(await self._socket(request=make_request(0)).has_permission("DT", "n1"))
+		self.assertFalse(await self._socket(request=make_request(0)).has_permission("DT", "n2"))
+
+	async def test_has_permission_is_kept_for_the_ttl(self):
+		calls = []
+		s = self._socket(request=make_request(1, record=calls))
+		self.assertTrue(await s.has_permission("DT", "n1"))
+		self.assertTrue(await s.has_permission("DT", "n1"))
+		self.assertTrue(await s.has_permission("DT", "n2"))
+		self.assertEqual(len(calls), 2)
+
+	async def test_the_sockets_of_a_user_share_the_answer(self):
+		calls = []
+		await self._socket(request=make_request(1, record=calls)).has_permission("DT", "n1")
+		await self._socket(request=make_request(1, record=calls)).has_permission("DT", "n1")
+		self.assertEqual(len(calls), 1)
+
+	async def test_two_users_do_not_share_the_answer(self):
+		calls = []
+		await self._socket(request=make_request(1, record=calls)).has_permission("DT", "n1")
+		s = self._socket(request=make_request(1, record=calls), user="c@d.com")
+		await s.has_permission("DT", "n1")
+		self.assertEqual(len(calls), 2)
+
+	async def test_a_kept_answer_expires(self):
+		calls = []
+		s = self._socket(request=make_request(1, record=calls))
+		with patch.object(auth_mod, "PERMISSION_TTL", -1):
+			await s.has_permission("DT", "n1")
+		await s.has_permission("DT", "n1")
+		self.assertEqual(len(calls), 2)
+
+	def _fill_cache(self, count: int, expiry: float) -> None:
+		auth_mod._permission_cache.update(
+			{("s1", "u", "DT", str(i), "read"): (True, expiry) for i in range(count)}
+		)
+
+	async def test_three_quarters_full_drops_the_expired_answers(self):
+		self._fill_cache(auth_mod.PERMISSION_PURGE_AT, 0)
+
+		await self._socket(request=make_request(1)).has_permission("DT", "n1")
+
+		self.assertNotIn(("s1", "u", "DT", "0", "read"), auth_mod._permission_cache)
+		self.assertEqual(len(auth_mod._permission_cache), auth_mod.PERMISSION_PURGE_AT)
+
+	async def test_a_full_cache_drops_the_oldest_fresh_answer(self):
+		self._fill_cache(auth_mod.PERMISSION_CACHE_MAX, time.monotonic() + 3600)
+
+		await self._socket(request=make_request(1)).has_permission("DT", "n1")
+
+		self.assertNotIn(("s1", "u", "DT", "0", "read"), auth_mod._permission_cache)
+		self.assertIn(("s1", "u", "DT", "1", "read"), auth_mod._permission_cache)
+		self.assertEqual(len(auth_mod._permission_cache), auth_mod.PERMISSION_CACHE_MAX)
+
+	async def test_a_failure_is_not_kept(self):
+		calls = []
+
+		async def failing_request(path, method="GET", params=None, body=None):
+			calls.append(path)
+			raise httpx.ConnectError("no web process")
+
+		s = self._socket(request=failing_request)
+		self.assertFalse(await s.has_permission("DT", "n1"))
+		self.assertFalse(await s.has_permission("DT", "n1"))
+		self.assertEqual(len(calls), 2)
 
 	async def test_has_permission_stays_on_the_loop(self):
 		# The check is async end to end, so it must not burn a worker thread — those
@@ -664,20 +849,26 @@ class TestFrappeContext(unittest.IsolatedAsyncioTestCase):
 
 
 class TestConfig(unittest.TestCase):
-	def _config(self, **conf: object) -> RealtimeConfig:
+	def _config(self, embedded: bool = False, **conf: object) -> RealtimeConfig:
 		import frappe
 
 		base = {"socketio_port": 9000, "redis_queue": "redis://127.0.0.1:11311"}
 		base.update(conf)
 		with patch.object(frappe, "get_common_site_config", return_value=base):
-			return get_config(sites_path=".")
-
-	def test_worker_threads_are_unset_by_default(self):
-		# Nothing built in dispatches to a thread, so the loop's own executor stands.
-		self.assertIsNone(self._config().worker_threads)
+			return get_config(sites_path=".", embedded=embedded)
 
 	def test_worker_threads_override(self):
 		self.assertEqual(self._config(socketio_worker_threads="8").worker_threads, 8)
+
+	def test_embedded_is_off_by_default(self):
+		# The process decides, not the site config: socketio_backend only names the
+		# realtime server of a bench that runs realtime apart.
+		self.assertFalse(self._config().embedded)
+		self.assertFalse(self._config(socketio_backend="python").embedded)
+		self.assertFalse(self._config(socketio_backend="node").embedded)
+
+	def test_embedded_comes_from_the_caller(self):
+		self.assertTrue(self._config(embedded=True).embedded)
 
 
 class TestServerApp(unittest.IsolatedAsyncioTestCase):
@@ -702,12 +893,23 @@ class TestServerApp(unittest.IsolatedAsyncioTestCase):
 
 		self.assertEqual(order, ["load", "wire"])
 
-	async def _startup(self, config: RealtimeConfig) -> MagicMock:
+	def _build(self, config: RealtimeConfig, **kwargs: object):
 		with (
 			patch.object(self.server_mod, "load_handlers", lambda *a, **k: None),
 			patch.object(self.server_mod, "wire", lambda *a, **k: None),
 		):
-			server = self.server_mod.RealtimeServer(config)
+			return self.server_mod.RealtimeServer(config, **kwargs)
+
+	def test_other_asgi_app_receives_non_socketio_traffic(self):
+		# Embedded, this is where the Frappe WSGI app is mounted.
+		sentinel = object()
+		self.assertIs(self._build(make_config(), other_asgi_app=sentinel).app.other_asgi_app, sentinel)
+
+	def test_unset_leaves_engineio_to_answer(self):
+		self.assertIsNone(self._build(make_config()).app.other_asgi_app)
+
+	async def _startup(self, config: RealtimeConfig) -> MagicMock:
+		server = self._build(config)
 		loop = asyncio.get_running_loop()
 		with (
 			patch.object(server.bridge, "start"),
@@ -717,8 +919,8 @@ class TestServerApp(unittest.IsolatedAsyncioTestCase):
 		return set_executor
 
 	async def test_the_loop_executor_is_left_alone_by_default(self):
-		# set_default_executor replaces it for the whole loop, and nothing built in
-		# dispatches to a thread.
+		# set_default_executor replaces it for the whole loop, which embedded is
+		# the host's. Nothing built in dispatches to a thread, so don't touch it.
 		(await self._startup(make_config())).assert_not_called()
 
 	async def test_worker_threads_installs_a_sized_executor(self):
@@ -754,6 +956,9 @@ class TestBridge(unittest.IsolatedAsyncioTestCase):
 
 
 class TestCoreHandlers(unittest.IsolatedAsyncioTestCase):
+	def setUp(self):
+		auth_mod._permission_cache.clear()
+
 	def _socket(
 		self,
 		sio: FakeSio,
@@ -793,7 +998,7 @@ class TestCoreHandlers(unittest.IsolatedAsyncioTestCase):
 		self.assertIn("doctype:ToDo", sio.rooms_of("sid1"))
 
 		sio2 = FakeSio()
-		deny = self._socket(sio2, request=make_request(0))
+		deny = self._socket(sio2, request=make_request(0), user="c@d.com")
 		await handlers_mod.doctype_subscribe(deny, "ToDo")
 		self.assertNotIn("doctype:ToDo", sio2.rooms_of("sid1"))
 

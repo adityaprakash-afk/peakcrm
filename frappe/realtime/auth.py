@@ -1,7 +1,10 @@
 # Copyright (c) 2026, Frappe Technologies Pvt. Ltd. and contributors
 # License: MIT. See LICENSE
 
+import asyncio
+import json
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from http.cookiejar import CookieJar
@@ -12,15 +15,22 @@ import httpx
 from redis import asyncio as aioredis
 from socketio.exceptions import ConnectionRefusedError
 
+import frappe
+from frappe.realtime import SOCKETIO_SECRET_KEY
 from frappe.realtime.config import RealtimeConfig
 from frappe.realtime.util import get_hostname, get_url, read_header, resolve_site_name
 
 logger = logging.getLogger("frappe.realtime")
 
-SOCKETIO_SECRET_KEY = "socketio_auth_secret"
-
 HttpMethod = Literal["GET", "POST", "PUT", "PATCH", "DELETE"]
 WebRequest = Callable[..., Awaitable[dict]]
+
+PERMISSION_TTL = 15
+PERMISSION_CACHE_MAX = 1024
+PERMISSION_PURGE_AT = PERMISSION_CACHE_MAX * 3 // 4
+
+# (site, user, doctype, name, ptype) -> (answer, expiry). One cache for the process.
+_permission_cache: dict[tuple[str, str, str, str, str], tuple[bool, float]] = {}
 
 
 @dataclass(frozen=True)
@@ -83,7 +93,14 @@ class Session:
 		return await self.request(path, method=method, params=params, body=body)
 
 	async def has_permission(self, doctype: str, name: str | None = None, ptype: str = "read") -> bool:
-		"""HTTP permission check against the web process (no DB in realtime)."""
+		"""HTTP permission check against the web process (no DB in realtime).
+
+		Each answer stays for PERMISSION_TTL seconds, for all the sockets of the user."""
+		key = (self.site, self.user, doctype, name or "", ptype)
+		now = time.monotonic()
+		if (cached := _permission_cache.get(key)) and now < cached[1]:
+			return cached[0]
+
 		try:
 			body = await self.get(
 				"/api/method/frappe.realtime.has_permission",
@@ -91,7 +108,20 @@ class Session:
 			)
 		except Exception:
 			return False
-		return bool(body.get("message"))
+
+		# One ttl for all the answers, thus the oldest answer is at the front. From
+		# PERMISSION_PURGE_AT the front goes if it is expired. At PERMISSION_CACHE_MAX it
+		# goes in all cases. pop() moves a new answer for an old key to the back.
+		while len(_permission_cache) >= PERMISSION_PURGE_AT:
+			oldest = next(iter(_permission_cache))
+			if _permission_cache[oldest][1] > now and len(_permission_cache) < PERMISSION_CACHE_MAX:
+				break
+			del _permission_cache[oldest]
+
+		allowed = bool(body.get("message"))
+		_permission_cache.pop(key, None)
+		_permission_cache[key] = (allowed, now + PERMISSION_TTL)
+		return allowed
 
 
 async def authenticate(environ: dict, namespace: str, config: RealtimeConfig) -> Session:
@@ -102,8 +132,8 @@ async def authenticate(environ: dict, namespace: str, config: RealtimeConfig) ->
 	"""
 	site = _validate_site(environ, namespace, config)
 	_validate_origin(environ)
-
 	credentials = _read_credentials(environ)
+
 	secret = await get_socketio_secret(config.redis_queue)
 	request = _make_request(environ, credentials, config, site, secret)
 	user_info = await _get_user_info(request)
@@ -166,13 +196,17 @@ def _read_sid(cookie_header: str | None) -> str | None:
 
 
 def _make_request(
-	environ: dict, credentials: Credentials, config: RealtimeConfig, site: str, secret: str | None
+	environ: dict, credentials: Credentials, config: RealtimeConfig, site: str, secret: str
 ) -> WebRequest:
 	"""Build the authenticated request helper toward the web (socket.frappe_request port).
 
 	Connect auth and every later permission check share this one coroutine, so
 	their timeout / redirect / cookie handling cannot drift apart."""
 	origin = read_header(environ, "Origin")
+
+	headers = _auth_headers(credentials, site, secret)
+	if config.embedded:
+		return _make_local_request(headers | {"Origin": origin} if origin else headers)
 
 	async def request(
 		path: str,
@@ -185,7 +219,7 @@ def _make_request(
 			get_url(origin, path, config),
 			params=params or {},
 			json=body,
-			headers=_auth_headers(credentials, site, secret),
+			headers=headers,
 		)
 		res.raise_for_status()
 		return res.json()
@@ -193,14 +227,59 @@ def _make_request(
 	return request
 
 
-def _auth_headers(credentials: Credentials, site: str, secret: str | None) -> dict[str, str]:
+def _get_local_client():
+	"""One client for the whole process, built on first use.
+
+	use_cookies=False leaves the client with no per-request state, so every
+	connection and worker thread can share one — and a jar would otherwise
+	overwrite our Cookie header and replay one user's sid onto the next connect."""
+	global _local_client
+	if _local_client is None:
+		from werkzeug.test import Client
+
+		from frappe.app import application
+
+		_local_client = Client(application, use_cookies=False)
+	return _local_client
+
+
+def _make_local_request(headers: dict[str, str]) -> WebRequest:
+	"""Same request, in this process. Embedded, loopback HTTP re-enters our own
+	process, so a saturated WSGI pool would stall every connect behind it.
+
+	Runs the real WSGI app, keeping session validation, permissions and the socket
+	secret on the code path the HTTP transport uses."""
+	client = _get_local_client()
+
+	def call(path: str, method: HttpMethod, params: dict | None, body: dict | None) -> dict:
+		# json=None is not the same as omitting it: werkzeug would send a "null" body.
+		response = client.open(
+			path,
+			method=method,
+			query_string=params or {},
+			headers=headers,
+			follow_redirects=True,
+			**({"json": body} if body is not None else {}),
+		)
+		if response.status_code >= 400:
+			raise ValueError(f"{method} {path} returned {response.status_code}")
+		return json.loads(response.get_data(as_text=True) or "{}")
+
+	async def request(
+		path: str,
+		method: HttpMethod = "GET",
+		params: dict | None = None,
+		body: dict | None = None,
+	) -> dict:
+		return await asyncio.to_thread(call, path, method, params, body)
+
+	return request
+
+
+def _auth_headers(credentials: Credentials, site: str, secret: str) -> dict[str, str]:
 	"""Web-process request headers: client credential + tenant + shared secret."""
-	headers = credentials.headers()
-	# Carry the tenant so loopback requests route to the right site.
-	headers["X-Frappe-Site-Name"] = site
-	if secret:
-		headers["X-Frappe-Socket-Secret"] = secret
-	return headers
+	# X-Frappe-Site-Name carries the tenant, so loopback requests route to the right site.
+	return credentials.headers() | {"X-Frappe-Site-Name": site, "X-Frappe-Socket-Secret": secret}
 
 
 async def _get_user_info(request: WebRequest) -> dict:
@@ -232,16 +311,21 @@ def _make_session(site: str, user_info: dict, request: WebRequest) -> Session:
 
 _secret_client: aioredis.Redis | None = None
 _http_client: httpx.AsyncClient | None = None
+_local_client = None
 
 
-async def get_socketio_secret(redis_url: str) -> str | None:
-	"""Read socketio_auth_secret from the no-auth queue redis (same key the web sets)."""
+async def get_socketio_secret(redis_url: str) -> str:
+	"""Read the shared realtime secret, and make it if it is not there yet.
+
+	The web makes the same key at its first get_user_info(). A side that could only
+	read would send no secret on a boot with an empty redis, and get {} back."""
 	global _secret_client
 	if _secret_client is None:
 		_secret_client = aioredis.from_url(redis_url)
 	value = await _secret_client.get(SOCKETIO_SECRET_KEY)
 	if value is None:
-		return None
+		await _secret_client.set(SOCKETIO_SECRET_KEY, frappe.generate_hash(length=32), nx=True)
+		value = await _secret_client.get(SOCKETIO_SECRET_KEY)
 	return value.decode() if isinstance(value, bytes) else value
 
 
@@ -271,6 +355,7 @@ async def close_clients() -> None:
 
 	Both are bound to the loop that created them, so a restart must rebuild them."""
 	global _http_client, _secret_client
+	_permission_cache.clear()
 	if _http_client is not None:
 		await _http_client.aclose()
 		_http_client = None

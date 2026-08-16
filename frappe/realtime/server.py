@@ -37,6 +37,13 @@ from frappe.realtime.dispatch import wire
 
 logger = logging.getLogger("frappe.realtime")
 
+# socketio and engineio log one line for each packet, and a client sends a ping
+# every 25 seconds. That is a debug tool, thus it gets a logger of its own and
+# stays quiet. Set this logger to INFO to see the packets.
+packet_logger = logging.getLogger("frappe.realtime.packets")
+if packet_logger.level == logging.NOTSET:
+	packet_logger.setLevel(logging.WARNING)
+
 
 class TolerantManager(socketio.AsyncManager):
 	"""Re-ack a duplicate namespace connect instead of rejecting it.
@@ -62,8 +69,8 @@ def create_sio() -> socketio.AsyncServer:
 		cors_credentials=True,
 		namespaces="*",
 		client_manager=TolerantManager(),
-		logger=logger,
-		engineio_logger=logger,
+		logger=packet_logger,
+		engineio_logger=packet_logger,
 	)
 
 
@@ -84,13 +91,13 @@ class RealtimeServer:
 	loop uvicorn runs.
 	"""
 
-	def __init__(self, config: RealtimeConfig | None = None):
+	def __init__(self, config: RealtimeConfig | None = None, other_asgi_app=None):
 		self.config = config or get_config()
 		self.sio = create_sio()
 		self.bridge = RedisBridge(self.sio, self.config.redis_queue)
-		# No other_asgi_app: engineio answers non-socket.io traffic with its own 404.
 		self.app = socketio.ASGIApp(
 			self.sio,
+			other_asgi_app=other_asgi_app,
 			on_startup=self._on_startup,
 			on_shutdown=self._on_shutdown,
 		)
@@ -117,14 +124,14 @@ class RealtimeServer:
 		self._server.should_exit = True
 
 	async def _on_startup(self) -> None:
-		# Only when asked: this replaces the executor for the whole loop, and nothing
-		# built in dispatches to a thread.
 		if self.config.worker_threads:
 			asyncio.get_running_loop().set_default_executor(
 				ThreadPoolExecutor(
-					max_workers=self.config.worker_threads, thread_name_prefix="realtime-worker"
+					max_workers=self.config.worker_threads,
+					thread_name_prefix="realtime-worker",
 				)
 			)
+
 		self.bridge.start()
 
 	async def _on_shutdown(self) -> None:
