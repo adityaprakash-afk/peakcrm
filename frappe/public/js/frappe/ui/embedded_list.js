@@ -21,6 +21,7 @@ frappe.ui.EmbeddedList = class EmbeddedList {
 				filters: {},
 				fields: ["name"],
 				order_by: null,
+				searchable: false,
 			},
 			opts
 		);
@@ -76,7 +77,7 @@ frappe.ui.EmbeddedList = class EmbeddedList {
 			  )}">`
 			: "";
 
-		if (!title && !description && !add) {
+		if (!title && !description && !add && !this.searchable) {
 			this.$header.hide();
 			return;
 		}
