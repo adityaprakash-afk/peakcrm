@@ -1,0 +1,67 @@
+{
+ "actions": [],
+ "autoname": "hash",
+ "creation": "2026-08-16 20:30:00.000000",
+ "description": "One of the dock's two stored layers. `user` is what tells them apart: set means that person's own arrangement, applied last and winning; blank means the site layer, curated by a Workspace Manager and applying to everyone. Both span every app and name none. The layer below them is not a document at all -- an app declares its fragment through the `add_to_dock` hook, because a dock row accumulates no state a hook cannot express. Same shape at both stored layers, because the rows are identical and the parent is what says whose they are; see `Custom Sidebar`, which layers the same way.",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "user",
+  "items_section",
+  "items"
+ ],
+ "fields": [
+  {
+   "description": "The person whose own arrangement this is. Blank means the site layer, which applies to everyone and is overridden by each user's own.",
+   "fieldname": "user",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "User",
+   "options": "User"
+  },
+  {
+   "fieldname": "items_section",
+   "fieldtype": "Section Break",
+   "label": "Dock Items"
+  },
+  {
+   "description": "The ordered entries this layer has an opinion about. Row order is the arrangement; an entry this layer never names keeps its incoming order and follows the ones it does, which is how a newly installed app's modules still reach someone who has already arranged their dock.",
+   "fieldname": "items",
+   "fieldtype": "Table",
+   "label": "Dock Items",
+   "options": "Dock Item"
+  }
+ ],
+ "grid_page_length": 50,
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2026-08-17 18:10:00.000000",
+ "modified_by": "Administrator",
+ "module": "Desk",
+ "name": "Dock",
+ "naming_rule": "Random",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Workspace Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "read": 1,
+   "role": "Desk User"
+  }
+ ],
+ "row_format": "Dynamic",
+ "sort_field": "creation",
+ "sort_order": "DESC",
+ "states": []
+}

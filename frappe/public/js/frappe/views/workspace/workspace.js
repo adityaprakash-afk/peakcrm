@@ -5,10 +5,10 @@ import Undo from "editorjs-undo";
 // rendered for Workspace Managers but stripped before the content is saved.
 const HIDDEN_NOTICE_MARKER = "workspace-hidden-notice";
 
-// The framework's fallback workspace, shown only when a user has no other workspace at all
-// (see get_workspaces). It's special-cased out of workspace listings across the codebase; here
-// it's kept out of the "not in any app" triage list, since it isn't a workspace anyone mounts.
-const WELCOME_WORKSPACE = "Welcome Workspace";
+// Rail id for the Manage Workspaces group holding workspaces with no module at all. Every tab
+// there is identified by its module name, and "" is not usable as one: `SettingsDialog` keys its
+// items by id and treats a falsy one as "no tab".
+const NO_MODULE_TAB = "__no_module__";
 
 // "Access" options in the New Workspace dialog -- a virtual field that maps to the
 // underlying `public` / `for_user` / `roles` fields:
@@ -75,22 +75,26 @@ frappe.views.Workspace = class Workspace {
 		}
 	}
 
-	// The apps a workspace can be mounted to (see `get_mountable_apps`), memoised for the life of
-	// the view -- the New Workspace dialog, the Manage Workspaces panel and the "not on any dock"
-	// prompt all need the same list, and the installed apps don't change under us.
-	get_mountable_apps() {
-		if (!this._mountable_apps) {
-			this._mountable_apps = frappe
-				.xcall("frappe.desk.doctype.workspace.workspace.get_mountable_apps")
-				.then((apps) => apps || []);
+	// The modules a workspace can be assigned to, memoised for the life of the view -- the New
+	// Workspace dialog, the Manage Workspaces panel and the "not on any dock" prompt all need
+	// the same list, and the installed modules don't change under us.
+	get_assignable_modules() {
+		if (!this._assignable_modules) {
+			this._assignable_modules = frappe
+				.xcall("frappe.desk.doctype.workspace.workspace.get_assignable_modules")
+				.then((modules) => modules || []);
 		}
-		return this._mountable_apps;
+		return this._assignable_modules;
 	}
 
-	// `app` is stored as the app's name ("erpnext") but should read as its title ("ERPNext"), so
-	// the Select gets {value, label} options rather than bare strings.
-	app_select_options(apps) {
-		return apps.map((app) => ({ value: app.app_name, label: app.app_title }));
+	// Modules are grouped by app in the label, since two apps can ship similarly named modules.
+	// A module the site owns is placed into no app's dock and has no app to name, so it reads as
+	// itself rather than claiming one.
+	module_select_options(modules) {
+		return modules.map((m) => ({
+			value: m.module,
+			label: m.app_title ? `${__(m.label)} (${__(m.app_title)})` : __(m.label),
+		}));
 	}
 
 	prepare_container() {
@@ -267,12 +271,11 @@ frappe.views.Workspace = class Workspace {
 			if (!this._page.public) {
 				app = "private";
 			} else {
-				app = this._page.app;
-				if (!app && this._page.module) {
-					app = frappe.boot.module_app[frappe.router.slug(this._page.module)];
-				}
-				// this._page.module && this.sidebar.show_sidebar_for_module(this._page.module);
-				if (!app) app = "frappe";
+				// derived from the module -- there is no `Workspace.app` any more
+				app =
+					(this._page.module &&
+						frappe.boot.module_app[frappe.router.slug(this._page.module)]) ||
+					"frappe";
 			}
 
 			if (typeof current_page.content == "string") {
@@ -393,7 +396,7 @@ frappe.views.Workspace = class Workspace {
 	// unmounted is worth raising, but not worth trapping someone over.
 	async add_mount_notice(page) {
 		// standard workspaces are mounted by the app that ships them, via their module
-		if (!page || page.app || page.standard || page.type !== "Workspace") return;
+		if (!page || page.module || page.standard || page.type !== "Workspace") return;
 		// show_page runs on every navigation -- don't stack dialogs on the same workspace
 		if (this.mount_dialog && this.mount_dialog.page_name === page.name) return;
 		// ...and once it's been waved off, leave it alone for the rest of the session rather
@@ -419,32 +422,32 @@ frappe.views.Workspace = class Workspace {
 			return;
 		}
 
-		await this.prompt_mount_workspace(page);
+		await this.prompt_assign_module(page);
 	}
 
-	// Ask which app to mount `page` to, then mount it and refresh the desk in place. Closing the
-	// dialog without choosing is fine -- it just won't ask again this session.
-	async prompt_mount_workspace(page) {
-		const apps = await this.get_mountable_apps();
+	// Ask which module `page` belongs to, then assign it and refresh the desk in place. Closing
+	// the dialog without choosing is fine -- it just won't ask again this session.
+	async prompt_assign_module(page) {
+		const modules = await this.get_assignable_modules();
 		let mounted = false;
 		const d = new frappe.ui.Dialog({
-			title: __("Add {0} to an app", [__(page.title)]),
+			title: __("Add {0} to a module", [__(page.title)]),
 			fields: [
 				{
 					fieldtype: "HTML",
 					fieldname: "why",
 					options: `<p class="text-muted">${__(
-						"This workspace isn't in any app's sidebar yet, so there's no way to navigate to it. Pick the app it belongs to."
+						"This workspace isn't in any module's sidebar yet, so there's no way to navigate to it. Pick the module it belongs to."
 					)}</p>`,
 				},
 				{
-					label: __("App"),
+					label: __("Module"),
 					fieldtype: "Select",
-					fieldname: "app",
+					fieldname: "module",
 					reqd: 1,
-					options: this.app_select_options(apps),
-					default: frappe.current_app && frappe.current_app.app_name,
-					description: __("Which app's sidebar this workspace appears in"),
+					options: this.module_select_options(modules),
+					default: frappe.app.sidebar?.current_module,
+					description: __("Which module's sidebar this workspace appears in"),
 				},
 			],
 			primary_action_label: __("Add"),
@@ -452,14 +455,14 @@ frappe.views.Workspace = class Workspace {
 				mounted = true;
 				d.hide();
 				frappe.call({
-					method: "frappe.desk.doctype.workspace.workspace.mount_workspace",
-					args: { name: page.name, app: values.app },
+					method: "frappe.desk.doctype.workspace.workspace.set_workspace_module",
+					args: { name: page.name, module: values.module },
 					freeze: true,
 					callback: (r) => {
 						if (!r.message) return;
 						this.apply_manager_changes(r.message);
 						frappe.show_alert({
-							message: __("Added {0} to {1}", [__(page.title), __(values.app)]),
+							message: __("Added {0} to {1}", [__(page.title), __(values.module)]),
 							indicator: "green",
 						});
 					},
@@ -482,93 +485,212 @@ frappe.views.Workspace = class Workspace {
 		d.show();
 	}
 
-	open_workspace_manager(current_page) {
-		// Two-pane manager: the list of workspaces the user can manage on the left, the
-		// selected workspace's access / appearance settings on the right. Replaces the
-		// old "route to the Workspace / Workspace Customization form" flow.
+	async open_workspace_manager(current_page) {
+		// Two-pane manager, shaped like the schema it manages: **modules** on the left, and the
+		// selected module's workspaces listed on the right. A workspace's module is what decides
+		// which dock lists it and whose sidebar carries it, so moving one between modules is the
+		// management task -- which makes the module, not the workspace, the thing to organise by.
+		// The old rail listed every workspace under Standard / Custom / Private, three groups
+		// that say nothing about where a workspace appears.
 		//
 		// The list comes from the server, not `frappe.boot.workspaces`: the bootinfo only
 		// carries the user's *own* private workspaces, but a Workspace Manager manages every
 		// workspace (including other users' private ones).
-		frappe
-			.call({
-				method: "frappe.desk.doctype.workspace.workspace.get_manageable_workspaces",
-			})
-			.then((r) => {
-				const manageable = r.message || [];
-				if (!manageable.length) return;
-
-				// "Not in any app" first -- those workspaces are on no dock, so this is the
-				// list to triage. Then Standard = public app-shipped, Custom = public but
-				// user-created, Private = per-user workspaces.
-				const unmounted = (p) => !p.app && !p.standard && p.title !== WELCOME_WORKSPACE;
-				const groups = [
-					{ label: __("Not in any app"), filter: unmounted },
-					{ label: __("Standard"), filter: (p) => p.public && p.standard },
-					{
-						label: __("Custom"),
-						filter: (p) => p.public && !p.standard && !unmounted(p),
-					},
-					{ label: __("Private"), filter: (p) => !p.public && !unmounted(p) },
-				];
-				const tabs = [];
-				groups.forEach(({ label, filter }) => {
-					const pages = manageable.filter(filter);
-					if (pages.length) {
-						tabs.push({
-							group: label,
-							items: pages.map((p) => this.workspace_manager_item(p)),
-						});
-					}
+		// `EmbeddedList` is a lazy bundle rather than part of the desk one, so it has to be here
+		// before a module panel renders. Loaded alongside the two reads rather than after them,
+		// and awaited as one so the first panel builds synchronously when the dialog opens.
+		const [manageable, modules] = await Promise.all([
+			frappe.xcall("frappe.desk.doctype.workspace.workspace.get_manageable_workspaces"),
+			this.get_assignable_modules(),
+			frappe.require("embedded_list.bundle.js").catch((e) => {
+				// eslint-disable-next-line no-console
+				console.error("Manage Workspaces: failed to load embedded_list.bundle.js", e);
+				frappe.ui.toast({
+					message: __("The workspace list may not load. Please refresh the page."),
+					type: "warning",
 				});
-
-				const has_current =
-					current_page && manageable.some((p) => p.name === current_page.name);
-				this.workspace_manager = new frappe.ui.SettingsDialog({
-					title: __("Manage Workspaces"),
-					tabs,
-					default_tab: has_current ? current_page.name : undefined,
-				});
-				this.workspace_manager.show();
-			});
-	}
-
-	workspace_manager_item(page) {
-		// a manager may see private workspaces owned by other users -- label whose they are
-		const owned_by_other =
-			!page.public && page.for_user && page.for_user !== frappe.session.user;
-		const label = owned_by_other ? `${__(page.title)} (${page.for_user})` : __(page.title);
-		return {
-			id: page.name,
-			label,
-			icon: page.icon || "layout-grid",
-			render: (panel) => this.render_workspace_manager_panel(panel, page),
-		};
-	}
-
-	async render_workspace_manager_panel(panel, page) {
-		panel.set_header({ title: __(page.title) });
-		panel.body.html(`<div class="text-muted">${__("Loading...")}</div>`);
-
-		const [settings, apps] = await Promise.all([
-			frappe.xcall("frappe.desk.doctype.workspace.workspace.get_workspace_settings", {
-				name: page.name,
 			}),
-			this.get_mountable_apps(),
 		]);
+		if (!manageable || !manageable.length) return;
+
+		this.manager_modules = modules;
+		const tabs = this.workspace_manager_tabs(manageable, modules);
+
+		this.workspace_manager = new frappe.ui.SettingsDialog({
+			title: __("Manage Workspaces"),
+			tabs,
+			default_tab: this.manager_tab_for(tabs, current_page && current_page.module),
+		});
+		this.workspace_manager.show();
+	}
+
+	// One rail item per module that holds something. Deliberately not every module on the site:
+	// the rail is how you *find* a workspace, and moving one into a module that holds none is the
+	// Module field's job, which offers the full list.
+	workspace_manager_tabs(manageable, modules) {
+		const meta = {};
+		(modules || []).forEach((m) => (meta[m.module] = m));
+
+		const by_module = new Map();
+		manageable.forEach((page) => {
+			page._access = page.standard
+				? __("Standard")
+				: page.public
+				? __("Everyone")
+				: page.for_user
+				? __("Private")
+				: __("Shared");
+			const key = page.module || "";
+			if (!by_module.has(key)) by_module.set(key, []);
+			by_module.get(key).push(page);
+		});
+
+		// Rank decides which lists lead, and the leaders are the ones worth triaging. Two states
+		// share the top: a workspace with no module at all, and one naming a module that isn't
+		// there -- a `Link` the database doesn't enforce, so a module can be renamed or deleted
+		// out from under one. Both are equally unreachable and both are fixed the same way, by
+		// the Module field, so they share a group. The site's own modules come next (where the
+		// migration parks anything that never declared one), then each app's.
+		const missing = (key) => Boolean(key) && !meta[key];
+		const rank = (key) => {
+			if (!key || missing(key)) return 0;
+			return meta[key].app_title ? 2 : 1;
+		};
+		const group_of = (key) => {
+			if (!key || missing(key)) return __("Needs a module");
+			return meta[key].app_title ? __(meta[key].app_title) : __("Site");
+		};
+
+		const keys = [...by_module.keys()].sort((a, b) => {
+			const am = meta[a] || {};
+			const bm = meta[b] || {};
+			return (
+				rank(a) - rank(b) ||
+				(am.app_title || "").localeCompare(bm.app_title || "") ||
+				(am.label || a).localeCompare(bm.label || b)
+			);
+		});
+
+		const groups = new Map();
+		keys.forEach((key) => {
+			// A workspace whose module can't be offered still has to appear, or it would drop
+			// out of the only dialog that can move it. `missing` also covers a module this
+			// particular user may not see (a block hides it), which is a different cause with
+			// the same consequence for them: they cannot navigate to it.
+			const module = meta[key] || {
+				module: key,
+				label: key || __("No module"),
+				app_title: null,
+				missing: Boolean(key),
+			};
+			const group = group_of(key);
+			if (!groups.has(group)) groups.set(group, []);
+			groups.get(group).push({
+				id: key || NO_MODULE_TAB,
+				label: __(module.label),
+				icon: module.missing || !key ? "alert-circle" : "folder-normal",
+				render: (panel) => this.render_module_panel(panel, module, by_module.get(key)),
+			});
+		});
+
+		return [...groups].map(([group, items]) => ({ group, items }));
+	}
+
+	// `SettingsDialog.activate` silently does nothing for an id it has no item for, which would
+	// leave the dialog open on a blank panel -- so a module is only offered as the landing tab
+	// once it's confirmed to be one.
+	manager_tab_for(tabs, module) {
+		const wanted = module || NO_MODULE_TAB;
+		const found = tabs.some((group) => group.items.some((item) => item.id === wanted));
+		return found ? wanted : undefined;
+	}
+
+	// A module's workspaces. The list and the per-workspace form are two views of the *same*
+	// panel (`set_view` swaps it whole, `refresh()` restores the list), so drilling in doesn't
+	// stack a second dialog over the first.
+	render_module_panel(panel, module, pages) {
+		const rows = pages || [];
+		panel.set_view({
+			title: __(module.label),
+			render: (p) => {
+				new frappe.ui.EmbeddedList({
+					wrapper: $('<div class="workspace-manager-list"></div>').appendTo(p.body),
+					// The line belongs to the list rather than the panel header above it: the
+					// list draws no header at all without a title, description or Add button,
+					// and the search box rides in that header -- so a bare list silently loses
+					// the one control a long module needs.
+					description: module.missing
+						? __(
+								"{0} workspace(s) name the module {1}, which doesn't exist on this site — nothing can navigate to them. Give each one a module below.",
+								[rows.length, module.module]
+						  )
+						: !module.module
+						? __(
+								"{0} workspace(s) have no module, so nothing can navigate to them. Give each one a module below.",
+								[rows.length]
+						  )
+						: module.app_title
+						? __("{0} workspace(s) in this module, which {1} ships.", [
+								rows.length,
+								__(module.app_title),
+						  ])
+						: __("{0} workspace(s) in this module, which this site owns.", [
+								rows.length,
+						  ]),
+					empty_message: __("No workspaces in this module."),
+					empty_icon: "layout-grid",
+					get_data: () => Promise.resolve(rows),
+					on_row_click: (row) => this.open_workspace_settings(panel, row),
+					columns: [
+						{
+							label: __("Workspace"),
+							fieldname: "title",
+							render: (row) => frappe.utils.escape_html(__(row.title)),
+						},
+						{
+							label: __("Access"),
+							fieldname: "_access",
+							type: "badge",
+							color: (row) =>
+								row.standard ? "blue" : row.public ? "green" : "gray",
+						},
+						// a manager sees private workspaces owned by other people -- whose they
+						// are is the column that tells them apart, since the titles won't
+						{ label: __("Owner"), fieldname: "for_user" },
+					],
+				}).refresh();
+			},
+		});
+	}
+
+	// The selected workspace's settings, in place of the list.
+	async open_workspace_settings(panel, page) {
+		panel.set_view({
+			title: __(page.title),
+			render: (p) => p.body.html(`<div class="text-muted">${__("Loading...")}</div>`),
+		});
+
+		const settings = await frappe.xcall(
+			"frappe.desk.doctype.workspace.workspace.get_workspace_settings",
+			{ name: page.name }
+		);
 		if (!settings) return;
 
-		const actions = [];
+		// Back before anything destructive, and it returns to the list rather than closing:
+		// sorting a module's workspaces means going in and out of this view repeatedly.
+		const actions = [
+			{ label: __("Back"), icon: "chevron-left", click: () => panel.refresh() },
+		];
 		if (!settings.standard) {
 			actions.push({
 				label: __("Delete"),
-				class: "btn-danger",
+				theme: "red",
 				click: () => this.delete_workspace_from_manager(page),
 			});
 		}
 		actions.push({
 			label: __("Save"),
-			primary: true,
+			variant: "solid",
 			click: (p) => this.save_workspace_from_manager(p, settings),
 		});
 
@@ -580,8 +702,25 @@ frappe.views.Workspace = class Workspace {
 				  )
 				: __("Control who can see this workspace and how it appears."),
 			actions,
-			fields: this.workspace_manager_fields(settings, apps),
+			fields: this.workspace_manager_fields(settings, this.manager_modules),
 		});
+	}
+
+	// Rebuild the rail after a change that can move a workspace between modules, and land on
+	// whichever module it went to -- watching it arrive is the point of doing this here.
+	async refresh_workspace_manager(module) {
+		if (!this.workspace_manager) return;
+
+		const manageable = await frappe.xcall(
+			"frappe.desk.doctype.workspace.workspace.get_manageable_workspaces"
+		);
+		if (!manageable || !manageable.length) {
+			this.workspace_manager.hide();
+			return;
+		}
+
+		const tabs = this.workspace_manager_tabs(manageable, this.manager_modules);
+		this.workspace_manager.reset(tabs, this.manager_tab_for(tabs, module));
 	}
 
 	workspace_manager_fields(settings, apps) {
@@ -617,17 +756,17 @@ frappe.views.Workspace = class Workspace {
 					: "",
 			},
 			{
-				label: __("App"),
-				fieldname: "app",
+				label: __("Module"),
+				fieldname: "module",
 				fieldtype: "Select",
-				options: this.app_select_options(apps || []),
-				default: settings.app,
-				// a standard workspace's app follows its module, and there's no per-site
-				// override to record a different one in
+				options: this.module_select_options(apps || []),
+				default: settings.module,
+				// a standard workspace's module is owned by the app that ships it, and there's
+				// no per-site override to record a different one in
 				read_only: settings.standard ? 1 : 0,
 				description: settings.standard
-					? __("A standard workspace stays in the app that ships it.")
-					: __("Which app's sidebar this workspace appears in"),
+					? __("A standard workspace stays in the module that ships it.")
+					: __("Which module's sidebar this workspace appears in"),
 			},
 			{
 				label: __("Icon"),
@@ -688,14 +827,17 @@ frappe.views.Workspace = class Workspace {
 				access,
 				roles,
 				// read-only for standard workspaces, so this only ever moves a custom one
-				app: values.app,
+				module: values.module,
 			},
 			freeze: true,
 			callback: (r) => {
 				if (!r.message) return;
 				this.apply_manager_changes(r.message);
 				frappe.show_alert({ message: __("Workspace updated"), indicator: "green" });
-				this.workspace_manager && this.workspace_manager.hide();
+				// Stay open on the module it now belongs to. Saving used to close the dialog,
+				// which made moving several workspaces a matter of reopening it each time --
+				// and left the one thing worth seeing, where it landed, unshown.
+				this.refresh_workspace_manager(values.module || settings.module);
 			},
 		});
 	}
@@ -715,7 +857,8 @@ frappe.views.Workspace = class Workspace {
 							message: __("Workspace {0} deleted", [__(page.title)]),
 							indicator: "green",
 						});
-						this.workspace_manager && this.workspace_manager.hide();
+						// back to the module it was in, which is where the next one to look at is
+						this.refresh_workspace_manager(page.module);
 					},
 				});
 			}
@@ -727,9 +870,10 @@ frappe.views.Workspace = class Workspace {
 		frappe.boot.workspaces = message.workspace_pages;
 		this.workspaces = frappe.boot.workspaces.pages;
 		this.setup_pages(frappe.boot.workspaces.pages);
-		frappe.boot.workspace_sidebar_item = message.sidebar_items;
-		// The dock is app-scoped: it lists `app_data[app].workspaces`. A workspace that just
-		// changed app (or gained one) only moves docks once this mapping is swapped in.
+		if (message.module_sidebars) frappe.boot.module_sidebars = message.module_sidebars;
+		if (message.entity_module) frappe.boot.entity_module = message.entity_module;
+		// The dock is app-scoped: it renders `app_data[app].dock`. A workspace that just changed
+		// app (or gained one) only moves docks once this mapping is swapped in.
 		if (message.app_data) frappe.boot.app_data = message.app_data;
 		this.reload();
 		// reload() re-derives the current page synchronously; re-render its sidebar so a rename
@@ -749,10 +893,13 @@ frappe.views.Workspace = class Workspace {
 			),
 			() => {
 				frappe.call({
-					method: "frappe.desk.doctype.workspace_customization.workspace_customization.reset_workspace_customization",
+					method: "frappe.desk.doctype.custom_workspace.custom_workspace.reset_workspace_customization",
 					args: { workspace: page.name },
 					freeze: true,
 					callback: () => {
+						// back on the app's layout, so the next layout save freezes it
+						// afresh and is worth warning about again
+						page.is_layout_customized = 0;
 						frappe.show_alert({
 							message: __("Workspace reset to standard"),
 							indicator: "green",
@@ -795,14 +942,19 @@ frappe.views.Workspace = class Workspace {
 			this.page.set_primary_action(
 				__("Save"),
 				() => {
-					this.clear_page_actions();
-					this.body.removeClass("edit-mode");
-					$("#full-search-button").removeClass("hidden");
-					this.save_page(page).then((saved) => {
-						if (!saved) return;
-						this.undo.readOnly = true;
-						this.editor.readOnly.toggle();
-						this.is_read_only = true;
+					// a standard workspace's first layout save freezes it against app
+					// updates, so it is confirmed before it happens, not reported after
+					this.confirm_layout_freeze(page).then((go_ahead) => {
+						if (!go_ahead) return;
+						this.clear_page_actions();
+						this.body.removeClass("edit-mode");
+						$("#full-search-button").removeClass("hidden");
+						this.save_page(page).then((saved) => {
+							if (!saved) return;
+							this.undo.readOnly = true;
+							this.editor.readOnly.toggle();
+							this.is_read_only = true;
+						});
 					});
 				},
 				null,
@@ -829,6 +981,28 @@ frappe.views.Workspace = class Workspace {
 		this.add_workspace_controls = false;
 	}
 
+	// A standard workspace's layout is stored as a *snapshot*, so saving one stops the app's
+	// later layout changes from reaching this site -- while its roles, icon and visibility
+	// keep updating, because those are stored as a diff. Say so at the point the user causes
+	// it. Only the first time: once the snapshot exists there is nothing left to warn about.
+	confirm_layout_freeze(page) {
+		const freezes = page.standard && !page.is_layout_customized && !frappe.boot.developer_mode;
+		if (!freezes) return Promise.resolve(true);
+
+		return new Promise((resolve) => {
+			frappe.confirm(
+				__(
+					"<b>{0}</b> is shipped by its app. Saving this layout keeps your arrangement, and the app's later changes to this page's layout will stop showing up here. Its roles, icon and visibility keep following the app either way, and <b>Reset to Standard</b> undoes this.",
+					[__(page.title)]
+				),
+				() => resolve(true),
+				() => resolve(false),
+				__("Save Layout"),
+				__("Cancel")
+			);
+		});
+	}
+
 	make_blocks_sortable() {
 		let me = this;
 		this.page_sortable = Sortable.create(
@@ -850,9 +1024,9 @@ frappe.views.Workspace = class Workspace {
 	async initialize_new_page() {
 		var me = this;
 		this.get_parent_pages();
-		// A workspace with no app lands on no dock, so ask for it up front rather than let the
-		// workspace be created stranded and rely on the "not on any dock" prompt to rescue it.
-		const apps = await this.get_mountable_apps();
+		// A workspace with no module lands on no dock, so ask for it up front rather than let
+		// the workspace be created stranded and rely on the "not on any dock" prompt to rescue it.
+		const apps = await this.get_assignable_modules();
 		const d = new frappe.ui.Dialog({
 			title: __("New Workspace"),
 			fields: [
@@ -921,13 +1095,13 @@ frappe.views.Workspace = class Workspace {
 					},
 				},
 				{
-					label: __("App"),
+					label: __("Module"),
 					fieldtype: "Select",
-					fieldname: "app",
+					fieldname: "module",
 					reqd: 1,
-					options: this.app_select_options(apps),
-					default: frappe.current_app && frappe.current_app.app_name,
-					description: __("Which app's sidebar this workspace appears in"),
+					options: this.module_select_options(apps),
+					default: frappe.app.sidebar?.current_module,
+					description: __("Which module's sidebar this workspace appears in"),
 				},
 				{
 					label: __("Icon"),
@@ -993,8 +1167,9 @@ frappe.views.Workspace = class Workspace {
 					icon: values.icon,
 					roles: values.access === ACCESS_GROUP ? values.roles || [] : [],
 					parent_page: values.parent || "",
-					// the app whose dock lists this workspace
-					app: values.app,
+					// the module this workspace belongs to -- it decides the dock entry it
+					// appears under, and defaults to the shell it was created from
+					module: values.module || frappe.app.sidebar?.current_module,
 					is_editable: true,
 					selected: true,
 					type: values.type,
@@ -1042,28 +1217,20 @@ frappe.views.Workspace = class Workspace {
 							frappe.boot.workspaces = r.message.workspace_pages;
 							me.workspaces = frappe.boot.workspaces.pages;
 							me.setup_pages(frappe.boot.workspaces.pages);
-							frappe.boot.workspace_sidebar_item = r.message.sidebar_items;
+							if (r.message.module_sidebars)
+								frappe.boot.module_sidebars = r.message.module_sidebars;
+							if (r.message.entity_module)
+								frappe.boot.entity_module = r.message.entity_module;
 						}
 
-						// Surface the new workspace in the selector right away (the boot.py fix
-						// makes it durable across reloads). Public ones are listed via their app's
-						// workspace list; private ones are auto-listed from frappe.workspaces.
-						if (new_page.public && new_page.app) {
-							let app = (frappe.boot.app_data || []).find(
-								(a) => a.app_name === new_page.app
-							);
-							if (app && !app.workspaces.includes(new_page.name)) {
-								app.workspaces.push(new_page.name);
-							}
-						}
-
-						// A new Workspace seeds a sidebar item linking to itself (see new_page),
-						// so it now has its own entry in the sidebar payload -- switch the sidebar
-						// to it so the shell reflects the just-created workspace.
-						if (frappe.boot.workspace_sidebar_item[new_page.name.toLowerCase()]) {
-							frappe.app.sidebar.setup(new_page.name);
-						} else if (new_page.public === 0) {
-							frappe.app.sidebar.setup("private");
+						// Switch the shell to the module the new workspace belongs to, so it
+						// reflects the just-created workspace. Nothing is pushed onto the rail:
+						// the dock lists an app's modules and the workspaces an `add_to_dock` row
+						// names, and a new workspace reaches the shell through its module's
+						// sidebar instead.
+						const module = frappe.app.sidebar.module_for_workspace(new_page.name);
+						if (module) {
+							frappe.app.sidebar.setup(module);
 						}
 
 						resolve();
@@ -1086,7 +1253,8 @@ frappe.views.Workspace = class Workspace {
 			frappe.workspace_list = [];
 			frappe.workspace_map = {};
 			for (let page of all_pages) {
-				if (!page.app && page.module) {
+				// `app` is derived, not stored -- consumers still read it off the page object
+				if (page.module) {
 					page.app = frappe.boot.module_app[frappe.slug(page.module)];
 				}
 				// store the full page (matching desk.js setup_workspaces) so consumers like the
@@ -1247,6 +1415,9 @@ frappe.views.Workspace = class Workspace {
 					},
 					callback: function (res) {
 						if (res.message) {
+							// the layout snapshot now exists, so the freeze has already
+							// happened -- don't warn about it again before the next save
+							page.is_layout_customized = 1;
 							me.discard = true;
 							me.reload();
 							if (window.Cypress) return;
